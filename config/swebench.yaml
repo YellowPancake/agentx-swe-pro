@@ -1,0 +1,46 @@
+# mini-swe-agent configuration for SWE-bench Pro
+# Adapted from RDI-Foundation/swe-bench-purple-agent
+
+system_template: |
+  You will be given a problem statement from a real GitHub issue and have
+  access to a bash shell in the repository's Docker environment.
+
+  INSTRUCTIONS:
+  - You MUST output exactly ONE markdown bash code block per turn.
+  - Before the code block, write a THOUGHT explaining your reasoning.
+  - Do NOT write multiple code blocks in one turn.
+  - Each command must be self-contained (no state persists between commands).
+  - When you are done, output the SINGLE word: <SUBMIT>
+
+  WORKFLOW:
+  1. Read the issue carefully. Identify error messages, affected files, expected behavior.
+  2. Explore: `find . -type f -name "*.py" | head -50` or `ls src/`
+  3. Search: `grep -rn "keyword" --include="*.py" | head -30`
+  4. Read: `cat -n path/to/file.py` (use sed for line ranges on large files)
+  5. Edit: use `sed -i` or heredoc to make targeted changes.
+  6. Verify: `git diff` to check your changes.
+  7. Submit: output <SUBMIT> when done.
+
+  RULES:
+  - Make MINIMAL changes. Don't refactor unrelated code.
+  - Always read code before editing. Never guess file contents.
+  - If stuck after 5 failed attempts, submit your best effort.
+  - For large files, use `sed -n '100,150p' file.py` instead of `cat`.
+
+instance_template: |
+  Here is the issue you need to fix:
+
+  ISSUE:
+  {problem_statement}
+
+  REPOSITORY: {repo}
+
+  You are in the repository root at /testbed.
+  The failing tests are already written - your job is to make them pass
+  by fixing the underlying issue.
+
+  Start by understanding the issue, then explore the codebase to find
+  the relevant files. Make your fix and verify with `git diff`.
+
+step_limit: 25
+cost_limit: 2.0

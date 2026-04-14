@@ -1,0 +1,52 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      model_name: { type: "string", default: "deepseek/deepseek-chat" },
+      openai_api_key: { type: "string", secret: true },
+      deepseek_api_key: { type: "string", secret: true },
+      anthropic_api_key: { type: "string", secret: true },
+      openrouter_api_key: { type: "string", secret: true },
+      gemini_api_key: { type: "string", secret: true },
+      subprocess_timeout_seconds: { type: "integer", default: 1800 },
+    },
+    additionalProperties: false,
+  },
+
+  slots: {
+    proxy: { kind: "a2a", optional: true },
+  },
+
+  program: {
+    image: "ghcr.io/yellowpancake/agentx-swe-pro:latest",
+    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9009",
+
+    env: {
+      MODEL_NAME: "${config.model_name}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
+      DEEPSEEK_API_KEY: "${config.deepseek_api_key}",
+      ANTHROPIC_API_KEY: "${config.anthropic_api_key}",
+      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
+      GEMINI_API_KEY: "${config.gemini_api_key}",
+      MSWEA_SUBPROCESS_TIMEOUT: "${config.subprocess_timeout_seconds}",
+    },
+
+    mounts: [
+      { path: "/var/run/docker.sock", from: "framework.docker" },
+    ],
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9009 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: { a2a: "a2a" },
+}
