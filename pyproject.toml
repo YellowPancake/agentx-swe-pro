@@ -1,14 +1,13 @@
 [project]
-name = "agentx-swe-pro"
+name = "swe-bench-purple-agent"
 version = "0.1.0"
-description = "AgentX Purple Agent for SWE-bench Pro — wraps mini-swe-agent to solve real GitHub issues"
+description = "A2A coding agent for SWE-bench Pro — wraps mini-swe-agent to solve real issues"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "a2a-sdk[http-server]>=0.3.20",
     "uvicorn>=0.38.0",
     "mini-swe-agent @ git+https://github.com/scaleapi/mini-swe-agent.git",
-    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

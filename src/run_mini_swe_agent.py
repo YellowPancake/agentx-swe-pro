@@ -1,119 +1,149 @@
-"""Subprocess runner: executes mini-swe-agent in isolation.
+#!/usr/bin/env python3
+"""
+Subprocess runner for mini-swe-agent.
 
-Called by agent.py via subprocess to avoid litellm/httpx conflicts
-with the A2A event loop. Reads instance JSON, runs the solver,
-writes result JSON.
+Invoked by agent.py as a child process so that litellm / httpx run in
+complete isolation from the A2A event loop.
+
+Usage:
+    python run_mini_swe_agent.py --instance-file /tmp/instance.json --result-file /tmp/result.json
+
+The instance JSON must contain:
+    instance_id, problem_statement, docker_image, base_commit,
+    model_name, llm_api_base, config_path
+
+Writes the patch result to --result-file as JSON:
+    {"patch": "...", "exit_status": "..."}
 """
 
+from __future__ import annotations
+
+import argparse
 import json
+import logging
 import os
 import sys
-import traceback
+from pathlib import Path
 
-def main():
-    instance_path = os.environ["INSTANCE_PATH"]
-    result_path = os.environ["RESULT_PATH"]
-    model_name = os.environ.get("MODEL_NAME", "deepseek/deepseek-chat")
-    llm_api_base = os.environ.get("LLM_API_BASE")
-    config_path = os.environ.get("MSWEA_CONFIG")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("mini-swe-agent-runner")
 
-    # mini-swe-agent env overrides
-    step_limit = int(os.environ.get("MSWEA_STEP_LIMIT", "25"))
-    cost_limit = float(os.environ.get("MSWEA_COST_LIMIT", "2.0"))
-    cmd_timeout = int(os.environ.get("MSWEA_CMD_TIMEOUT", "300"))
-    subprocess_timeout = int(os.environ.get("MSWEA_SUBPROCESS_TIMEOUT", "1800"))
-    max_tokens = int(os.environ.get("MSWEA_MAX_TOKENS", "4096"))
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--instance-file", required=True)
+    parser.add_argument("--result-file", required=True)
+    args = parser.parse_args()
 
-    with open(instance_path) as f:
-        instance = json.load(f)
+    with open(args.instance_file) as f:
+        inst = json.load(f)
 
-    instance_id = instance.get("instance_id", "unknown")
-    problem_statement = instance.get("problem_statement", "")
-    docker_image = instance.get("docker_image", "")
-    base_commit = instance.get("base_commit", "")
-    repo = instance.get("repo", "")
-    hints = instance.get("hints", "")
+    instance_id = inst["instance_id"]
+    problem_statement = inst["problem_statement"]
+    docker_image = inst["docker_image"]
+    model_name = inst["model_name"]
+    llm_api_base = inst.get("llm_api_base")
+    config_path = inst["config_path"]
 
-    print(f"[runner] Instance: {instance_id}", file=sys.stderr)
-    print(f"[runner] Model: {model_name}", file=sys.stderr)
-    print(f"[runner] Docker image: {docker_image}", file=sys.stderr)
-    print(f"[runner] Step limit: {step_limit}, Cost limit: ${cost_limit}", file=sys.stderr)
+    import yaml
+    from minisweagent.agents.default import AgentConfig, DefaultAgent
+    from minisweagent.environments.docker import DockerEnvironment
+    from minisweagent.models.litellm_model import LitellmModel
 
-    patch = ""
+    with open(config_path) as f:
+        swebench_config = yaml.safe_load(f)
+    agent_cfg = swebench_config.get("agent", {})
+
+    cmd_timeout = int(os.environ.get("MSWEA_CMD_TIMEOUT", 300))
+    step_limit = int(os.environ.get("MSWEA_STEP_LIMIT", 75))
+    cost_limit = float(os.environ.get("MSWEA_COST_LIMIT", 15.0))
+    temperature = float(os.environ.get("MSWEA_TEMPERATURE", 0.0))
+    llm_timeout = int(os.environ.get("MSWEA_LLM_TIMEOUT", 120))
+    max_tokens = int(os.environ.get("MSWEA_MAX_TOKENS", 4096))
+
+    logger.info("Starting mini-swe-agent for %s (model=%s)", instance_id, model_name)
+
+    env = DockerEnvironment(
+        image=docker_image,
+        cwd="/app",
+        timeout=cmd_timeout,
+        run_args=["--rm", "--entrypoint", ""],
+        env={
+            "PAGER": "cat",
+            "MANPAGER": "cat",
+            "LESS": "-R",
+            "PIP_PROGRESS_BAR": "off",
+            "TQDM_DISABLE": "1",
+        },
+    )
+
     try:
-        from mini_swe_agent import DefaultAgent, DockerEnvironment, LitellmModel
+        model_kwargs = {
+            "temperature": temperature,
+            "drop_params": True,
+            "timeout": llm_timeout,
+            "max_tokens": max_tokens,
+        }
+        extra_kwargs = {}
+        if "anthropic" in model_name or "claude" in model_name:
+            extra_kwargs["set_cache_control"] = "default_end"
+        if llm_api_base:
+            model_kwargs["base_url"] = llm_api_base
 
-        # Load config if available
-        agent_kwargs = {}
-        if config_path and os.path.exists(config_path):
-            import yaml
-            with open(config_path) as f:
-                config = yaml.safe_load(f)
-            agent_kwargs = {
-                "system_template": config.get("system_template"),
-                "instance_template": config.get("instance_template"),
-            }
-            # Override limits from config if not set via env
-            if "MSWEA_STEP_LIMIT" not in os.environ:
-                step_limit = config.get("step_limit", step_limit)
-            if "MSWEA_COST_LIMIT" not in os.environ:
-                cost_limit = config.get("cost_limit", cost_limit)
-
-        # Create Docker environment (sibling container)
-        env = DockerEnvironment(
-            image_name=docker_image,
-            timeout=cmd_timeout,
+        model = LitellmModel(
+            model_name=model_name,
+            model_kwargs=model_kwargs,
+            **extra_kwargs,
         )
 
-        # Create LLM model
-        model_kwargs = {"model": model_name, "max_tokens": max_tokens}
-        if llm_api_base:
-            model_kwargs["api_base"] = llm_api_base
-        model = LitellmModel(**model_kwargs)
-
-        # Create agent
         agent = DefaultAgent(
             model=model,
-            environment=env,
-            step_limit=step_limit,
-            cost_limit=cost_limit,
-            **{k: v for k, v in agent_kwargs.items() if v is not None},
+            env=env,
+            system_template=agent_cfg.get("system_template", AgentConfig.system_template),
+            instance_template=agent_cfg.get("instance_template", AgentConfig.instance_template),
+            action_observation_template=agent_cfg.get("action_observation_template", AgentConfig.action_observation_template),
+            format_error_template=agent_cfg.get("format_error_template", AgentConfig.format_error_template),
+            step_limit=agent_cfg.get("step_limit", step_limit),
+            cost_limit=agent_cfg.get("cost_limit", cost_limit),
         )
 
-        print(f"[runner] Starting agent for {instance_id}...", file=sys.stderr)
+        # Wrap step() to log each LLM exchange
+        _orig_step = agent.step
+        step_num = 0
 
-        # Run agent
-        result = agent.run(
-            problem_statement=problem_statement,
-            base_commit=base_commit,
-            repo=repo,
-            hints=hints,
+        def _logging_step():
+            nonlocal step_num
+            step_num += 1
+            logger.info("step %d | calls=%d cost=$%.4f", step_num, model.n_calls, model.cost)
+            result = _orig_step()
+            action = result.get("output", "")[:200]
+            logger.info("step %d | action output: %s%s", step_num, action, "..." if len(result.get("output", "")) > 200 else "")
+            return result
+
+        agent.step = _logging_step
+
+        exit_status, result_message, patch = agent.run(problem_statement)
+
+        logger.info("mini-swe-agent finished: %s (patch length: %d)", exit_status, len(patch) if patch else 0)
+        Path(args.result_file).write_text(
+            json.dumps({"exit_status": str(exit_status), "patch": patch or ""})
         )
-
-        patch = result.patch if hasattr(result, "patch") else str(result)
-        print(f"[runner] Patch generated: {len(patch)} chars", file=sys.stderr)
-
-    except Exception as e:
-        print(f"[runner] ERROR: {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        patch = ""
-
     finally:
-        # Cleanup Docker image to save disk space
-        if docker_image:
-            try:
-                import subprocess as sp
-                sp.run(["docker", "rmi", "-f", docker_image],
-                       capture_output=True, timeout=30)
-                print(f"[runner] Cleaned up image: {docker_image}", file=sys.stderr)
-            except Exception:
-                pass
-
-    # Write result
-    with open(result_path, "w") as f:
-        json.dump({"instance_id": instance_id, "patch": patch}, f)
-
-    print(f"[runner] Done: {instance_id}", file=sys.stderr)
+        env.cleanup()
+        # Remove the coding image to free disk on CI runners
+        try:
+            import subprocess
+            subprocess.run(
+                ["docker", "rmi", "-f", docker_image],
+                capture_output=True,
+                timeout=60,
+            )
+            logger.info("Removed coding image: %s", docker_image)
+        except Exception as e:
+            logger.warning("Failed to remove coding image %s: %s", docker_image, e)
 
 
 if __name__ == "__main__":

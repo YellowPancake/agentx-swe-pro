@@ -1,176 +1,335 @@
-"""Core agent: parses SWE-bench task JSON, launches mini-swe-agent in a subprocess,
-streams status updates, and returns the patch as an artifact."""
+"""
+Purple agent — SWE-bench Pro participant (coding agent).
+
+Uses mini-swe-agent to actually solve issues inside Docker containers.
+Falls back to gold patches if --use-gold-patches is set (for pipeline testing).
+"""
+
+from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import queue
 import subprocess
-import sys
 import tempfile
 import threading
-import queue
+import time
 from pathlib import Path
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, TaskState, Part, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
 
-CONFIG_DIR = Path(__file__).parent.parent / "config"
+from messenger import Messenger
 
+logger = logging.getLogger("purple-agent")
 
+# Resolve once at import time
+_RUNNER_SCRIPT = str(Path(__file__).resolve().parent / "run_mini_swe_agent.py")
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parent.parent / "config" / "swebench.yaml")
+
+_SENTINEL = None  # marks end of stderr stream
+_HEARTBEAT_INTERVAL = 60  # seconds between SSE keepalive updates
 class Agent:
-    def __init__(self, model: str = "deepseek/deepseek-chat", llm_api_base: str | None = None):
-        self.model = model
+    def __init__(
+        self,
+        data_dir: str = "data",
+        use_gold_patches: bool = False,
+        model_name: str = "gpt-4o",
+        llm_api_base: str | None = None,
+    ):
+        self.messenger = Messenger()
+        self.data_dir = data_dir
+        self.use_gold_patches = use_gold_patches
+        self.model_name = model_name
         self.llm_api_base = llm_api_base
+        self._gold_patches: dict[str, str] | None = None
+
+    @property
+    def gold_patches(self) -> dict[str, str]:
+        """Lazy-load gold patches keyed by instance_id from instances.jsonl."""
+        if self._gold_patches is None:
+            path = Path(self.data_dir) / "instances.jsonl"
+            if path.exists():
+                self._gold_patches = {}
+                with open(path) as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        d = json.loads(line)
+                        if d.get("gold_patch"):
+                            self._gold_patches[d["instance_id"]] = d["gold_patch"]
+            else:
+                self._gold_patches = {}
+        return self._gold_patches
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
 
-        # Parse the SWE-bench task JSON from the message
-        task_data = self._parse_task(input_text)
-        if not task_data:
+        await updater.update_status(
+            TaskState.working, new_agent_text_message("Parsing problem...")
+        )
+
+        # Parse the problem payload from the green agent
+        try:
+            problem = json.loads(input_text)
+            instance_id = problem["instance_id"]
+            problem_statement = problem["problem_statement"]
+            docker_image = problem["docker_image"]
+            base_commit = problem.get("base_commit", "")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
             await updater.add_artifact(
-                parts=[Part(root=TextPart(text=json.dumps({"instance_id": "unknown", "patch": ""})))],
-                name="patch",
+                parts=[Part(root=TextPart(text=f"Error: could not parse problem payload: {e}"))],
+                name="Error",
             )
             return
 
-        instance_id = task_data.get("instance_id", "unknown")
+        # ---- Gold patch mode (for testing) ----
+        if self.use_gold_patches:
+            patch = self.gold_patches.get(instance_id)
+            if patch is None:
+                await updater.add_artifact(
+                    parts=[Part(root=TextPart(text=f"Error: no gold patch for {instance_id}"))],
+                    name="Error",
+                )
+                return
+
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message(f"Returning gold patch for {instance_id}"),
+            )
+            result = json.dumps({"instance_id": instance_id, "patch": patch})
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=result))],
+                name="Patch",
+            )
+            return
+
+        # ---- Real mode: use mini-swe-agent ----
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message(f"Working on {instance_id} with {self.model}..."),
+            new_agent_text_message(
+                f"Solving {instance_id} with mini-swe-agent (image: {docker_image})..."
+            ),
         )
 
-        # Run mini-swe-agent in a subprocess to isolate litellm from A2A event loop
-        patch = await self._run_solver(task_data, updater)
+        try:
+            patch = await self._run_mini_swe_agent(
+                instance_id=instance_id,
+                problem_statement=problem_statement,
+                docker_image=docker_image,
+                base_commit=base_commit,
+                updater=updater,
+            )
+        except Exception as e:
+            logger.exception(f"mini-swe-agent failed for {instance_id}")
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=f"Error: mini-swe-agent failed: {e}"))],
+                name="Error",
+            )
+            return
 
-        # Return result as artifact
+        if not patch:
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=f"Error: mini-swe-agent produced no patch for {instance_id}"))],
+                name="Error",
+            )
+            return
+
         result = json.dumps({"instance_id": instance_id, "patch": patch})
+        logger.info(
+            "Publishing patch artifact for %s (patch_len=%d, payload_len=%d)",
+            instance_id,
+            len(patch),
+            len(result),
+        )
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=result))],
-            name="patch",
+            name="Patch",
         )
+        logger.info("Finished publishing patch artifact for %s", instance_id)
 
-    def _parse_task(self, text: str) -> dict | None:
-        """Extract SWE-bench task JSON from message text."""
-        # Try parsing the whole text as JSON
+    async def _run_mini_swe_agent(
+        self,
+        *,
+        instance_id: str,
+        problem_statement: str,
+        docker_image: str,
+        base_commit: str,
+        updater: TaskUpdater,
+    ) -> str | None:
+        """Run mini-swe-agent as a subprocess, fully isolated from the A2A event loop.
+
+        stderr streams live to both the server log and as A2A status updates
+        back to the green agent.  stdout is captured for the JSON result.
+        """
+        from minisweagent.config import get_config_path
+
+        config_path = _DEFAULT_CONFIG
+        if not Path(config_path).exists():
+            config_path = str(get_config_path("swebench"))
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix=f"mswea-{instance_id}-", delete=False
+        ) as f:
+            json.dump({
+                "instance_id": instance_id,
+                "problem_statement": problem_statement,
+                "docker_image": docker_image,
+                "base_commit": base_commit,
+                "model_name": self.model_name,
+                "llm_api_base": self.llm_api_base,
+                "config_path": config_path,
+            }, f)
+            instance_file = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix=f"mswea-result-{instance_id}-", delete=False
+        ) as f:
+            result_file = f.name
+
         try:
-            data = json.loads(text)
-            if "problem_statement" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
+            timeout = int(os.environ.get("MSWEA_SUBPROCESS_TIMEOUT", 1800))
 
-        # Try extracting JSON from markdown code block
-        import re
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group(1))
-                if "problem_statement" in data:
-                    return data
-            except json.JSONDecodeError:
-                pass
+            # Thread-safe queue: subprocess thread pushes lines, async task consumes them
+            log_queue: queue.Queue[str | None] = queue.Queue()
 
-        # Try finding JSON object in text
-        brace_start = text.find("{")
-        if brace_start >= 0:
-            depth = 0
-            for i in range(brace_start, len(text)):
-                if text[i] == "{":
-                    depth += 1
-                elif text[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            data = json.loads(text[brace_start:i + 1])
-                            if "problem_statement" in data:
-                                return data
-                        except json.JSONDecodeError:
-                            pass
-                        break
-
-        print(f"WARNING: Could not parse task JSON from message: {text[:200]}")
-        return None
-
-    async def _run_solver(self, task_data: dict, updater: TaskUpdater) -> str:
-        """Launch mini-swe-agent as a subprocess and stream status updates."""
-        instance_id = task_data.get("instance_id", "unknown")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            instance_path = os.path.join(tmpdir, "instance.json")
-            result_path = os.path.join(tmpdir, "result.json")
-
-            with open(instance_path, "w") as f:
-                json.dump(task_data, f)
-
-            # Build subprocess environment
-            env = os.environ.copy()
-            env["INSTANCE_PATH"] = instance_path
-            env["RESULT_PATH"] = result_path
-            env["MODEL_NAME"] = self.model
-            if self.llm_api_base:
-                env["LLM_API_BASE"] = self.llm_api_base
-
-            # Config file path
-            config_path = CONFIG_DIR / "swebench.yaml"
-            if config_path.exists():
-                env["MSWEA_CONFIG"] = str(config_path)
-
-            runner_script = str(Path(__file__).parent / "run_mini_swe_agent.py")
-
-            # Launch subprocess
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, runner_script,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            # Start subprocess in a background thread
+            sub_future: asyncio.Future[tuple[str, int]] = asyncio.get_event_loop().run_in_executor(
+                None,
+                self._run_subprocess,
+                instance_file,
+                result_file,
+                timeout,
+                log_queue,
             )
 
-            # Stream stderr for status updates + heartbeats
-            heartbeat_task = asyncio.create_task(
-                self._heartbeat(updater, instance_id, proc)
-            )
-
-            stderr_lines = []
-            try:
-                async for line in proc.stderr:
-                    decoded = line.decode("utf-8", errors="replace").strip()
-                    if decoded:
-                        stderr_lines.append(decoded)
-                        # Send periodic status updates (every 10 lines)
-                        if len(stderr_lines) % 10 == 0:
-                            status_msg = decoded[:200]
-                            await updater.update_status(
-                                TaskState.working,
-                                new_agent_text_message(f"[{instance_id}] {status_msg}"),
-                            )
-            except Exception:
-                pass
-
-            await proc.wait()
-            heartbeat_task.cancel()
-
-            # Read result
-            if os.path.exists(result_path):
-                with open(result_path) as f:
-                    result = json.load(f)
-                return result.get("patch", "")
-            else:
-                print(f"No result file for {instance_id}, exit code: {proc.returncode}")
-                if stderr_lines:
-                    print(f"Last stderr: {stderr_lines[-3:]}")
-                return ""
-
-    async def _heartbeat(self, updater: TaskUpdater, instance_id: str, proc):
-        """Send heartbeat every 60s to keep SSE connection alive."""
-        try:
-            while proc.returncode is None:
-                await asyncio.sleep(60)
-                if proc.returncode is None:
+            # Forward log lines as A2A status updates while subprocess runs.
+            # A heartbeat is sent every _HEARTBEAT_INTERVAL seconds when no
+            # real status update has been emitted, keeping upstream proxies
+            # (e.g. the agentbeats-gateway reverse proxy) from timing out on
+            # long-lived SSE connections.
+            _last_update = time.monotonic()
+            while True:
+                # Send heartbeat if enough time has passed, regardless of
+                # queue activity.  This ensures SSE bytes reach the upstream
+                # proxy even when the subprocess produces a steady stream of
+                # non-step log lines that would otherwise starve the
+                # heartbeat (it previously only fired on queue-timeout).
+                if time.monotonic() - _last_update >= _HEARTBEAT_INTERVAL:
                     await updater.update_status(
                         TaskState.working,
-                        new_agent_text_message(f"[{instance_id}] Still working..."),
+                        new_agent_text_message("still working..."),
                     )
-        except asyncio.CancelledError:
-            pass
+                    _last_update = time.monotonic()
+
+                try:
+                    line = await asyncio.to_thread(log_queue.get, timeout=0.5)
+                except Exception:
+                    # queue.get timed out — check if subprocess is done.
+                    if sub_future.done():
+                        break
+                    continue
+
+                if line is _SENTINEL:
+                    break
+
+                logger.info("[runner] %s", line)
+                # Send step lines back to green agent as status updates
+                if "step " in line:
+                    # Extract the meaningful part after the log prefix
+                    # e.g. "2026-03-24 ... INFO step 3 | calls=2 cost=$0.05"
+                    parts = line.split(" INFO ", 1)
+                    status_text = parts[1] if len(parts) > 1 else line
+                    await updater.update_status(
+                        TaskState.working,
+                        new_agent_text_message(status_text),
+                    )
+                    _last_update = time.monotonic()
+
+            logger.info("Awaiting subprocess future for %s", instance_id)
+            stdout, returncode = await sub_future
+            logger.info(
+                "Subprocess future resolved for %s (returncode=%s, stdout_len=%d)",
+                instance_id,
+                returncode,
+                len(stdout or ""),
+            )
+
+            if returncode != 0:
+                raise RuntimeError(
+                    f"mini-swe-agent subprocess exited with code {returncode}"
+                )
+
+            logger.info("Reading runner result file for %s from %s", instance_id, result_file)
+            try:
+                output = json.loads(Path(result_file).read_text())
+            except (OSError, json.JSONDecodeError):
+                logger.error(
+                    "Runner result file was not valid JSON for %s (returncode=%s, result_file=%s, stdout_len=%d, stdout_preview=%r)",
+                    instance_id,
+                    returncode,
+                    result_file,
+                    len(stdout or ""),
+                    (stdout or "")[:200],
+                )
+                raise
+            patch = output.get("patch", "")
+
+            logger.info(f"mini-swe-agent finished for {instance_id}: {output.get('exit_status')}")
+            logger.info(f"  patch length: {len(patch)}")
+
+            logger.info("Returning patch from _run_mini_swe_agent for %s", instance_id)
+            return patch if patch else None
+        finally:
+            Path(instance_file).unlink(missing_ok=True)
+            Path(result_file).unlink(missing_ok=True)
+
+    @staticmethod
+    def _run_subprocess(
+        instance_file: str,
+        result_file: str,
+        timeout: int,
+        log_queue: queue.Queue[str | None],
+    ) -> tuple[str, int]:
+        """Run the runner script, pushing stderr lines into the queue."""
+        proc = subprocess.Popen(
+            [
+                "python",
+                _RUNNER_SCRIPT,
+                "--instance-file",
+                instance_file,
+                "--result-file",
+                result_file,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ},
+        )
+        stdout_chunks: list[str] = []
+
+        def _drain_stdout() -> None:
+            assert proc.stdout is not None
+            stdout_chunks.append(proc.stdout.read())
+
+        stdout_thread = threading.Thread(target=_drain_stdout, daemon=True)
+        stdout_thread.start()
+
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                log_queue.put(line.rstrip("\n"))
+
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            log_queue.put(_SENTINEL)
+
+        stdout_thread.join()
+        stdout = "".join(stdout_chunks)
+        return stdout, proc.returncode
