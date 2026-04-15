@@ -1,22 +1,28 @@
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
+  experimental_features: ["docker"],
 
   config_schema: {
     type: "object",
     properties: {
-      model_name: { type: "string", default: "deepseek/deepseek-chat" },
+      model_name: {
+        type: "string",
+        description: "LLM model name via litellm (e.g., deepseek/deepseek-chat, gpt-4o-mini)",
+        default: "deepseek/deepseek-chat",
+      },
       openai_api_key: { type: "string", secret: true },
       deepseek_api_key: { type: "string", secret: true },
       anthropic_api_key: { type: "string", secret: true },
       openrouter_api_key: { type: "string", secret: true },
       gemini_api_key: { type: "string", secret: true },
-      subprocess_timeout_seconds: { type: "integer", default: 1800 },
+      subprocess_timeout_seconds: {
+        type: "integer",
+        description: "Wall-clock timeout for one mini-swe-agent subprocess run.",
+        default: 900,
+      },
     },
+    required: [],
     additionalProperties: false,
-  },
-
-  slots: {
-    proxy: { kind: "a2a", optional: true },
   },
 
   program: {
@@ -25,11 +31,11 @@
 
     env: {
       MODEL_NAME: "${config.model_name}",
-      OPENAI_API_KEY: "${config.openai_api_key}",
-      DEEPSEEK_API_KEY: "${config.deepseek_api_key}",
-      ANTHROPIC_API_KEY: "${config.anthropic_api_key}",
-      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
-      GEMINI_API_KEY: "${config.gemini_api_key}",
+      OPENAI_API_KEY: { when: "config.openai_api_key", value: "${config.openai_api_key}" },
+      DEEPSEEK_API_KEY: { when: "config.deepseek_api_key", value: "${config.deepseek_api_key}" },
+      ANTHROPIC_API_KEY: { when: "config.anthropic_api_key", value: "${config.anthropic_api_key}" },
+      OPENROUTER_API_KEY: { when: "config.openrouter_api_key", value: "${config.openrouter_api_key}" },
+      GEMINI_API_KEY: { when: "config.gemini_api_key", value: "${config.gemini_api_key}" },
       MSWEA_SUBPROCESS_TIMEOUT: "${config.subprocess_timeout_seconds}",
     },
 
