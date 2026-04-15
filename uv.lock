@@ -40,7 +40,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "a2a-sdk", extra = ["http-server"] },
     { name = "mini-swe-agent" },
-    { name = "pyyaml" },
     { name = "uvicorn" },
 ]
 
@@ -58,7 +57,6 @@ requires-dist = [
     { name = "mini-swe-agent", git = "https://github.com/scaleapi/mini-swe-agent.git" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.24.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
     { name = "uvicorn", specifier = ">=0.38.0" },
 ]
 provides-extras = ["test"]

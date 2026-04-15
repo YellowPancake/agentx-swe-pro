@@ -1,5 +1,5 @@
 [project]
-name = "swe-bench-purple-agent"
+name = "agentx-swe-pro"
 version = "0.1.0"
 description = "A2A coding agent for SWE-bench Pro — wraps mini-swe-agent to solve real issues"
 readme = "README.md"
