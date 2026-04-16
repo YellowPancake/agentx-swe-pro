@@ -31,7 +31,7 @@
 
     env: {
       MSWEA_COST_TRACKING: "ignore_errors",
-      MSWEA_MAX_TOKENS: "2048",
+      MSWEA_MAX_TOKENS: "4096",
       MODEL_NAME: "${config.model_name}",
       OPENAI_API_KEY: { when: "config.openai_api_key", value: "${config.openai_api_key}" },
       DEEPSEEK_API_KEY: { when: "config.deepseek_api_key", value: "${config.deepseek_api_key}" },
